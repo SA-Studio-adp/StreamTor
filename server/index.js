@@ -5,6 +5,9 @@ import mime from 'mime-types';
 import { spawn } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { auth, library, progress } from './auth.js';
+import { run, inputUrl } from './ff.js';
+import { subs } from './subs.js';
 
 const PORT = process.env.PORT || 3000;
 const TMDB = process.env.TMDB_API_KEY || '';
@@ -18,6 +21,10 @@ app.use(express.json());
 app.use(express.static(WEB));
 
 const getTorrent = async (hash) => client.get(hash);
+app.use('/api/auth', auth);
+app.use('/api/library', library);
+app.use('/api/progress', progress);
+app.use('/api/subs', subs(getTorrent));
 
 async function addTorrent(src) {
   try {
@@ -35,7 +42,7 @@ async function addTorrent(src) {
 }
 
 const info = (t) => ({
-  hash: t.infoHash, name: t.name, size: t.length, progress: t.progress,
+  hash: t.infoHash, name: t.name, magnet: t.magnetURI, size: t.length, progress: t.progress,
   speed: t.downloadSpeed, peers: t.numPeers,
   files: t.files.map((f, i) => ({ index: i, name: f.name, path: f.path, size: f.length, type: mime.lookup(f.name) || 'application/octet-stream' })),
 });
@@ -76,17 +83,28 @@ app.get('/api/stream/:hash/:i', async (req, res) => {
   s.pipe(res);
 });
 
-// On-the-fly transcoding (MKV, AVI, etc.) to fragmented MP4. Needs ffmpeg installed.
+// On-the-fly transcoding to fragmented MP4. ?a= picks the audio track, ?t= the start time in seconds.
 app.get('/api/transcode/:hash/:i', async (req, res) => {
   const f = (await getTorrent(req.params.hash))?.files[+req.params.i];
   if (!f) return res.sendStatus(404);
+  const t = Math.max(0, +req.query.t || 0);
   res.set('Content-Type', 'video/mp4');
-  const ff = spawn('ffmpeg', ['-i', 'pipe:0', '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1']);
-  const src = f.createReadStream();
-  src.pipe(ff.stdin);
-  ff.stdin.on('error', () => {});
+  const ff = spawn('ffmpeg', ['-v', 'error', ...(t ? ['-ss', String(t)] : []), '-i', inputUrl(req.params.hash, req.params.i), '-map', '0:v:0?', '-map', `0:a:${+req.query.a || 0}?`, '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ac', '2', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1']);
+  ff.on('error', () => res.end());
   ff.stdout.pipe(res);
-  res.on('close', () => { src.destroy(); ff.kill('SIGKILL'); });
+  res.on('close', () => ff.kill('SIGKILL'));
+});
+
+// Lists the audio and subtitle tracks inside a file (needs ffprobe)
+app.get('/api/probe/:hash/:i', async (req, res) => {
+  try {
+    const j = JSON.parse(await run('ffprobe', ['-v', 'error', '-print_format', 'json', '-show_streams', '-show_format', inputUrl(req.params.hash, req.params.i)], 60000));
+    const of = (type) => j.streams.filter((s) => s.codec_type === type).map((s, index) => ({ index, lang: s.tags?.language || 'und', title: s.tags?.title || '', codec: s.codec_name, channels: s.channels, default: !!s.disposition?.default }));
+    const bitmap = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'];
+    res.json({ duration: +j.format?.duration || 0, audio: of('audio'), subs: of('subtitle').map((s) => ({ ...s, text: !bitmap.includes(s.codec) })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ZIP the whole torrent, or one folder with ?folder=path
