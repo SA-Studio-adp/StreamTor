@@ -1,0 +1,7 @@
+{
+  "name": "streamtor-server",
+  "type": "module",
+  "private": true,
+  "scripts": { "start": "node index.js" },
+  "dependencies": { "archiver": "^7.0.1", "express": "^4.19.2", "mime-types": "^2.1.35", "webtorrent": "^2.5.1" }
+}
